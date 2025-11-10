@@ -5,10 +5,6 @@ from streamlit_folium import st_folium
 import numpy as np
 import sys
 
-# Check Python version and show warning
-if sys.version_info >= (3, 12):
-    st.warning("⚠️ Using Python 3.12+ - Make sure your packages are compatible")
-
 # Konfigurasi halaman
 st.set_page_config(
     page_title="ESB vs Scraper Mapping",
@@ -213,7 +209,7 @@ def create_map(df_esb, df_scraper, df_matches):
         # Return default map as fallback
         return folium.Map(location=[-6.2, 106.8], zoom_start=10)
 
-# Main app dengan error handling
+# Main app
 def main():
     st.title("📍 ESB vs Scraper Data Mapping")
     st.markdown("Visualisasi hasil matching data ESB dengan data Scraper 3 Pulau")
