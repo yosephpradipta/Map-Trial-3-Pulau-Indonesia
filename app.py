@@ -3,9 +3,12 @@ import pandas as pd
 import folium
 from streamlit_folium import st_folium
 import numpy as np
-import sys
+import psutil
+from folium.plugins import MarkerCluster
 
-# Konfigurasi halaman
+# ========================================
+# KONFIGURASI HALAMAN
+# ========================================
 st.set_page_config(
     page_title="ESB vs Scraper Mapping",
     page_icon="📍",
@@ -13,358 +16,241 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Fungsi untuk load data dengan error handling
+# ========================================
+# FUNGSI: LOAD DATA (OPTIMASI MEMORI)
+# ========================================
 @st.cache_data
-def load_data():
+def load_data(max_points=1000):
     try:
-        # Load data ESB
-        df_esb = pd.read_csv('Tarikan_data_ESB_3_Pulau_2025.csv')
-        
-        # Load data scraper
-        df_scraper = pd.read_csv('data_3_pulau_final.csv')
-        
-        # Load hasil matching
-        df_matches = pd.read_csv('esb_3pulau_exact_matching_matches.csv')
-        
+        # Kolom yang dibutuhkan
+        base_cols = ['latitude', 'longitude', 'brandName', 'address']
+        dtype_float = {'latitude': 'float32', 'longitude': 'float32'}
+        dtype_cat = {'brandName': 'category'}
+
+        # Load ESB
+        df_esb = pd.read_csv('Tarikan_data_ESB_3_Pulau_2025.csv',
+                             usecols=base_cols,
+                             dtype={**dtype_float, **dtype_cat})
+
+        # Load Scraper
+        df_scraper = pd.read_csv('data_3_pulau_final.csv',
+                                 usecols=base_cols,
+                                 dtype={**dtype_float, **dtype_cat})
+
+        # Load Match
+        match_cols = ['latitude_esb', 'longitude_esb', 'latitude_pulau', 'longitude_pulau',
+                      'brandName_esb', 'brandName_pulau', 'match_confidence', 'distance_m']
+        df_matches = pd.read_csv('esb_3pulau_exact_matching_matches.csv',
+                                 usecols=match_cols,
+                                 dtype={'latitude_esb': 'float32', 'longitude_esb': 'float32',
+                                        'latitude_pulau': 'float32', 'longitude_pulau': 'float32',
+                                        'match_confidence': 'float32', 'distance_m': 'float32'})
+
+        # Batasi jumlah titik (sesuai slider)
+        df_esb = df_esb.head(max_points).dropna(subset=['latitude', 'longitude'])
+        df_scraper = df_scraper.head(max_points).dropna(subset=['latitude', 'longitude'])
+        df_matches = df_matches.head(max_points // 2)
+
+        # Monitor RAM
+        process = psutil.Process()
+        mem_mb = process.memory_info().rss / (1024 ** 2)
+        st.sidebar.write(f"🧠 **RAM digunakan**: {mem_mb:.1f} MB")
+
         return df_esb, df_scraper, df_matches
+
     except FileNotFoundError as e:
-        st.error(f"File not found: {e}")
-        st.info("Please make sure all CSV files are in the same directory as this app")
+        st.error(f"File tidak ditemukan: {e}")
+        st.info("Pastikan semua file CSV ada di repo GitHub.")
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     except Exception as e:
         st.error(f"Error loading data: {e}")
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-# Fungsi untuk membuat peta dengan safety checks
+
+# ========================================
+# FUNGSI: BUAT PETA DENGAN MARKER CLUSTER
+# ========================================
 def create_map(df_esb, df_scraper, df_matches):
     try:
-        # Collect all coordinates safely
-        all_lats = []
-        all_lons = []
-        
-        # ESB coordinates
-        if not df_esb.empty and 'latitude' in df_esb.columns and 'longitude' in df_esb.columns:
-            esb_lats = df_esb['latitude'].dropna()
-            esb_lons = df_esb['longitude'].dropna()
-            if len(esb_lats) > 0:
-                all_lats.extend(esb_lats)
-                all_lons.extend(esb_lons)
-        
-        # Scraper coordinates
-        if not df_scraper.empty and 'latitude' in df_scraper.columns and 'longitude' in df_scraper.columns:
-            scraper_lats = df_scraper['latitude'].dropna()
-            scraper_lons = df_scraper['longitude'].dropna()
-            if len(scraper_lats) > 0:
-                all_lats.extend(scraper_lats)
-                all_lons.extend(scraper_lons)
-        
-        # Match coordinates
-        if not df_matches.empty:
-            if 'latitude_esb' in df_matches.columns and 'longitude_esb' in df_matches.columns:
-                match_esb_lats = df_matches['latitude_esb'].dropna()
-                match_esb_lons = df_matches['longitude_esb'].dropna()
-                if len(match_esb_lats) > 0:
-                    all_lats.extend(match_esb_lats)
-                    all_lons.extend(match_esb_lons)
-        
-        # Calculate center or use default
-        if len(all_lats) > 0 and len(all_lons) > 0:
-            center_lat = np.mean(all_lats)
-            center_lon = np.mean(all_lons)
-        else:
-            center_lat = -6.2  # Default: Jakarta
-            center_lon = 106.8
-        
-        # Buat peta base
+        # Hitung pusat peta
+        all_lats = pd.concat([df_esb['latitude'], df_scraper['latitude']], ignore_index=True)
+        all_lons = pd.concat([df_esb['longitude'], df_scraper['longitude']], ignore_index=True)
+        center_lat = all_lats.mean() if len(all_lats) > 0 else -6.2
+        center_lon = all_lons.mean() if len(all_lons) > 0 else 106.8
+
+        # Peta base
         m = folium.Map(
             location=[center_lat, center_lon],
             zoom_start=10,
-            tiles='OpenStreetMap'
+            tiles='CartoDB positron',
+            prefer_canvas=True
         )
-        
-        # Tambahkan layer groups
-        esb_group = folium.FeatureGroup(name='📗 ESB Data (Orange)', show=True)
-        scraper_group = folium.FeatureGroup(name='📘 Scraper Data (Blue)', show=True)
-        matches_group = folium.FeatureGroup(name='✅ Irisan Match (Green)', show=True)
-        
-        # 1. Plot data ESB (orange) - dengan safety check
-        if not df_esb.empty and 'latitude' in df_esb.columns and 'longitude' in df_esb.columns:
-            for idx, row in df_esb.dropna(subset=['latitude', 'longitude']).iterrows():
-                try:
-                    folium.CircleMarker(
-                        location=[row['latitude'], row['longitude']],
-                        radius=4,
-                        popup=f"""
-                            <b>ESB Data</b><br>
-                            Brand: {row.get('brandName', 'N/A')}<br>
-                            Alamat: {row.get('address', 'N/A')}<br>
-                            Lat: {row['latitude']:.4f}, Lon: {row['longitude']:.4f}
-                        """,
-                        tooltip=f"ESB: {row.get('brandName', 'N/A')}",
-                        color='orange',
-                        fillColor='orange',
-                        fillOpacity=0.7,
-                        weight=1
-                    ).add_to(esb_group)
-                except Exception as e:
-                    continue  # Skip invalid coordinates
-        
-        # 2. Plot data Scraper (biru) - dengan safety check
-        if not df_scraper.empty and 'latitude' in df_scraper.columns and 'longitude' in df_scraper.columns:
-            for idx, row in df_scraper.dropna(subset=['latitude', 'longitude']).iterrows():
-                try:
-                    folium.CircleMarker(
-                        location=[row['latitude'], row['longitude']],
-                        radius=4,
-                        popup=f"""
-                            <b>Scraper Data</b><br>
-                            Brand: {row.get('brandName', 'N/A')}<br>
-                            Alamat: {row.get('address', 'N/A')}<br>
-                            Lat: {row['latitude']:.4f}, Lon: {row['longitude']:.4f}
-                        """,
-                        tooltip=f"Scraper: {row.get('brandName', 'N/A')}",
-                        color='blue',
-                        fillColor='blue',
-                        fillOpacity=0.7,
-                        weight=1
-                    ).add_to(scraper_group)
-                except Exception as e:
-                    continue  # Skip invalid coordinates
-        
-        # 3. Plot irisan/match (hijau) - dengan safety check
-        if not df_matches.empty:
-            for idx, row in df_matches.iterrows():
-                try:
-                    # Pastikan koordinat valid
-                    if (pd.notna(row['latitude_esb']) and pd.notna(row['longitude_esb']) and 
-                        pd.notna(row['latitude_pulau']) and pd.notna(row['longitude_pulau'])):
-                        
-                        # Buat polyline antara ESB dan Scraper untuk match
-                        folium.PolyLine(
-                            locations=[
-                                [row['latitude_esb'], row['longitude_esb']],
-                                [row['latitude_pulau'], row['longitude_pulau']]
-                            ],
-                            color='green',
-                            weight=2,
-                            opacity=0.6,
-                            popup=f"""
-                                <b>Match Result</b><br>
-                                Confidence: {row.get('match_confidence', 0):.3f}<br>
-                                Distance: {row.get('distance_m', 0):.1f}m<br>
-                                ESB: {row.get('brandName_esb', 'N/A')}<br>
-                                Scraper: {row.get('brandName_pulau', 'N/A')}
-                            """
-                        ).add_to(matches_group)
-                        
-                        # Titik ESB dari match (hijau)
-                        folium.CircleMarker(
-                            location=[row['latitude_esb'], row['longitude_esb']],
-                            radius=6,
-                            popup=f"""
-                                <b>ESB (Match)</b><br>
-                                Brand: {row.get('brandName_esb', 'N/A')}<br>
-                                Branch: {row.get('branchName_esb', 'N/A')}<br>
-                                Confidence: {row.get('match_confidence', 0):.3f}<br>
-                                Match Level: {row.get('match_level', 'N/A')}
-                            """,
-                            tooltip=f"Match ESB: {row.get('brandName_esb', 'N/A')}",
-                            color='green',
-                            fillColor='green',
-                            fillOpacity=0.9,
-                            weight=2
-                        ).add_to(matches_group)
-                        
-                        # Titik Scraper dari match (hijau)
-                        folium.CircleMarker(
-                            location=[row['latitude_pulau'], row['longitude_pulau']],
-                            radius=6,
-                            popup=f"""
-                                <b>Scraper (Match)</b><br>
-                                Brand: {row.get('brandName_pulau', 'N/A')}<br>
-                                Distance: {row.get('distance_m', 0):.1f}m<br>
-                                Address Words: {row.get('address_common_words', 0)}
-                            """,
-                            tooltip=f"Match Scraper: {row.get('brandName_pulau', 'N/A')}",
-                            color='darkgreen',
-                            fillColor='darkgreen',
-                            fillOpacity=0.9,
-                            weight=2
-                        ).add_to(matches_group)
-                except Exception as e:
-                    continue  # Skip invalid match rows
-        
-        # Tambahkan semua groups ke peta
-        esb_group.add_to(m)
-        scraper_group.add_to(m)
-        matches_group.add_to(m)
-        
-        # Tambahkan layer control
+
+        # Layer groups dengan MarkerCluster
+        esb_group = MarkerCluster(name='📗 ESB Data (Orange)').add_to(m)
+        scraper_group = MarkerCluster(name='📘 Scraper Data (Blue)').add_to(m)
+        match_group = MarkerCluster(name='✅ Match (Green)').add_to(m)
+
+        # === PLOT ESB ===
+        for _, row in df_esb.iterrows():
+            folium.CircleMarker(
+                location=[row['latitude'], row['longitude']],
+                radius=4,
+                color='orange',
+                fillColor='orange',
+                fillOpacity=0.7,
+                weight=1,
+                popup=folium.Popup(
+                    f"<b>ESB</b><br>"
+                    f"Brand: {row.get('brandName', 'N/A')}<br>"
+                    f"Alamat: {row.get('address', 'N/A')}",
+                    max_width=300
+                ),
+                tooltip=f"ESB: {row.get('brandName', 'N/A')}"
+            ).add_to(esb_group)
+
+        # === PLOT SCRAPER ===
+        for _, row in df_scraper.iterrows():
+            folium.CircleMarker(
+                location=[row['latitude'], row['longitude']],
+                radius=4,
+                color='blue',
+                fillColor='blue',
+                fillOpacity=0.7,
+                weight=1,
+                popup=folium.Popup(
+                    f"<b>Scraper</b><br>"
+                    f"Brand: {row.get('brandName', 'N/A')}<br>"
+                    f"Alamat: {row.get('address', 'N/A')}",
+                    max_width=300
+                ),
+                tooltip=f"Scraper: {row.get('brandName', 'N/A')}"
+            ).add_to(scraper_group)
+
+        # === PLOT MATCH ===
+        for _, row in df_matches.iterrows():
+            if pd.notna(row['latitude_esb']) and pd.notna(row['longitude_esb']) and \
+               pd.notna(row['latitude_pulau']) and pd.notna(row['longitude_pulau']):
+
+                # Garis match
+                folium.PolyLine(
+                    locations=[
+                        [row['latitude_esb'], row['longitude_esb']],
+                        [row['latitude_pulau'], row['longitude_pulau']]
+                    ],
+                    color='green',
+                    weight=2,
+                    opacity=0.6,
+                    popup=folium.Popup(
+                        f"<b>Match</b><br>"
+                        f"Confidence: {row.get('match_confidence', 0):.3f}<br>"
+                        f"Jarak: {row.get('distance_m', 0):.1f} m<br>"
+                        f"ESB: {row.get('brandName_esb', 'N/A')}<br>"
+                        f"Scraper: {row.get('brandName_pulau', 'N/A')}",
+                        max_width=300
+                    )
+                ).add_to(match_group)
+
+                # Titik ESB
+                folium.CircleMarker(
+                    location=[row['latitude_esb'], row['longitude_esb']],
+                    radius=6, color='green', fillOpacity=0.9,
+                    popup=folium.Popup(f"<b>ESB Match</b><br>{row.get('brandName_esb', 'N/A')}")
+                ).add_to(match_group)
+
+                # Titik Scraper
+                folium.CircleMarker(
+                    location=[row['latitude_pulau'], row['longitude_pulau']],
+                    radius=6, color='darkgreen', fillOpacity=0.9,
+                    popup=folium.Popup(f"<b>Scraper Match</b><br>{row.get('brandName_pulau', 'N/A')}")
+                ).add_to(match_group)
+
+        # Layer control
         folium.LayerControl().add_to(m)
-        
+
         return m
-    
+
     except Exception as e:
-        st.error(f"Error creating map: {e}")
-        # Return default map as fallback
+        st.error(f"Error membuat peta: {e}")
         return folium.Map(location=[-6.2, 106.8], zoom_start=10)
 
-# Main app
+
+# ========================================
+# MAIN APP
+# ========================================
 def main():
     st.title("📍 ESB vs Scraper Data Mapping")
-    st.markdown("Visualisasi hasil matching data ESB dengan data Scraper 3 Pulau")
-    
-    # Sidebar
-    st.sidebar.header("Dashboard Controls")
-    
-    # Load data
-    with st.spinner('Loading data...'):
-        df_esb, df_scraper, df_matches = load_data()
-    
-    # Check if data loaded successfully
-    if df_esb.empty or df_scraper.empty or df_matches.empty:
-        st.error("❌ Failed to load one or more data files. Please check:")
-        st.info("""
-        1. All CSV files are in the same directory
-        2. File names are correct:
-           - Tarikan_data_ESB_3_Pulau_2025.csv
-           - data_3_pulau_final.csv  
-           - esb_3pulau_exact_matching_matches.csv
-        3. Files are properly committed to GitHub
-        """)
-        return
-    
-    # Tampilkan statistics di sidebar
-    st.sidebar.subheader("📊 Statistics")
-    st.sidebar.metric("Total ESB Data", f"{len(df_esb):,}")
-    st.sidebar.metric("Total Scraper Data", f"{len(df_scraper):,}")
-    st.sidebar.metric("Successful Matches", f"{len(df_matches):,}")
-    
-    match_rate = (len(df_matches) / len(df_esb)) * 100 if len(df_esb) > 0 else 0
-    st.sidebar.metric("Match Rate", f"{match_rate:.2f}%")
-    
-    # Filter options
-    st.sidebar.subheader("🔍 Filter Options")
-    
-    # Confidence filter
-    min_confidence = st.sidebar.slider(
-        "Minimum Confidence Score",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.6,
-        step=0.05,
-        help="Filter matches based on confidence score"
-    )
-    
-    # Distance filter
-    max_distance = st.sidebar.slider(
-        "Maximum Distance (meters)",
-        min_value=0,
+    st.markdown("Visualisasi hasil matching data ESB & Scraper 3 Pulau")
+
+    # Sidebar Controls
+    st.sidebar.header("⚙️ Kontrol Dashboard")
+
+    max_points = st.sidebar.slider(
+        "🔍 Maksimal titik per layer",
+        min_value=100,
         max_value=5000,
         value=1000,
-        step=100,
-        help="Filter matches based on distance between points"
+        step=500,
+        help="Kurangi untuk hemat memori"
     )
-    
-    # Apply filters
-    try:
-        filtered_matches = df_matches[
-            (df_matches['match_confidence'] >= min_confidence) & 
-            (df_matches['distance_m'] <= max_distance)
-        ]
-        st.sidebar.metric("Filtered Matches", f"{len(filtered_matches):,}")
-    except Exception as e:
-        st.error(f"Error applying filters: {e}")
-        filtered_matches = df_matches
-    
-    # Tabs untuk different views
-    tab1, tab2, tab3 = st.tabs(["🗺️ Interactive Map", "📈 Match Analysis", "📋 Data Details"])
-    
+
+    min_confidence = st.sidebar.slider(
+        "Minimum Confidence",
+        0.0, 1.0, 0.6, 0.05
+    )
+    max_distance = st.sidebar.slider(
+        "Maksimal Jarak (meter)",
+        0, 5000, 1000, 100
+    )
+
+    # Load data
+    with st.spinner('Memuat data...'):
+        df_esb, df_scraper, df_matches = load_data(max_points)
+
+    if df_esb.empty or df_scraper.empty:
+        st.error("Gagal memuat data. Periksa file CSV di repo.")
+        return
+
+    # Filter match
+    filtered_matches = df_matches[
+        (df_matches['match_confidence'] >= min_confidence) &
+        (df_matches['distance_m'] <= max_distance)
+    ]
+
+    # Stats
+    st.sidebar.subheader("📊 Statistik")
+    st.sidebar.metric("ESB Data", f"{len(df_esb):,}")
+    st.sidebar.metric("Scraper Data", f"{len(df_scraper):,}")
+    st.sidebar.metric("Match (setelah filter)", f"{len(filtered_matches):,}")
+
+    # Tabs
+    tab1, tab2, tab3 = st.tabs(["🗺️ Peta Interaktif", "📈 Analisis", "📋 Detail"])
+
     with tab1:
-        st.subheader("Interactive Mapping")
-        st.markdown(f"""
-        **Legend:**
-        - 🟢 **Green**: Successful matches ({len(filtered_matches):,} points)
-        - 🟠 **Orange**: ESB data only ({len(df_esb):,} points)  
-        - 🔵 **Blue**: Scraper data only ({len(df_scraper):,} points)
-        """)
-        
-        # Buat peta dengan data yang sudah difilter
+        st.subheader("Peta Interaktif")
         map_obj = create_map(df_esb, df_scraper, filtered_matches)
-        
-        # Tampilkan peta
-        st_folium(map_obj, width=1200, height=600)
-    
+        st_folium(map_obj, width=1200, height=600, key="map")
+
     with tab2:
-        st.subheader("Match Analysis")
-        
+        st.subheader("Ringkasan Match")
         col1, col2, col3 = st.columns(3)
-        
         with col1:
-            exact_matches = filtered_matches['exact_brand_match'].sum() if 'exact_brand_match' in filtered_matches.columns else 0
-            st.metric("Exact Brand Matches", f"{exact_matches:,}")
-        
+            st.metric("Exact Match", filtered_matches.get('exact_brand_match', pd.Series([0])).sum())
         with col2:
-            avg_distance = filtered_matches['distance_m'].mean() if 'distance_m' in filtered_matches.columns else 0
-            st.metric("Average Distance", f"{avg_distance:.1f}m")
-        
+            st.metric("Rata-rata Jarak", f"{filtered_matches['distance_m'].mean():.1f} m")
         with col3:
-            avg_confidence = filtered_matches['match_confidence'].mean() if 'match_confidence' in filtered_matches.columns else 0
-            st.metric("Average Confidence", f"{avg_confidence:.3f}")
-        
-        # Analysis charts dengan safety checks
-        if not filtered_matches.empty:
-            if 'match_confidence' in filtered_matches.columns:
-                st.subheader("Confidence Score Distribution")
-                try:
-                    confidence_bins = pd.cut(filtered_matches['match_confidence'], 
-                                           bins=[0.6, 0.7, 0.8, 0.9, 1.0], 
-                                           right=True)
-                    conf_counts = confidence_bins.value_counts().sort_index()
-                    st.bar_chart(conf_counts)
-                except Exception as e:
-                    st.warning("Could not display confidence distribution")
-            
-            if 'distance_m' in filtered_matches.columns:
-                st.subheader("Distance Distribution")
-                try:
-                    distance_bins = pd.cut(filtered_matches['distance_m'], 
-                                         bins=[0, 100, 500, 1000, 5000], 
-                                         right=True)
-                    dist_counts = distance_bins.value_counts().sort_index()
-                    st.bar_chart(dist_counts)
-                except Exception as e:
-                    st.warning("Could not display distance distribution")
-    
+            st.metric("Rata-rata Confidence", f"{filtered_matches['match_confidence'].mean():.3f}")
+
     with tab3:
-        st.subheader("Match Details")
-        
-        # Tampilkan tabel dengan matches
+        st.subheader("Detail Match")
         if not filtered_matches.empty:
-            display_columns = ['brandName_esb', 'brandName_pulau', 'match_confidence', 'distance_m']
-            available_columns = [col for col in display_columns if col in filtered_matches.columns]
-            
-            if available_columns:
-                st.dataframe(
-                    filtered_matches[available_columns].sort_values('match_confidence', ascending=False),
-                    use_container_width=True
-                )
-                
-                # Download button untuk filtered matches
-                try:
-                    csv = filtered_matches.to_csv(index=False)
-                    st.download_button(
-                        label="📥 Download Filtered Matches as CSV",
-                        data=csv,
-                        file_name=f"filtered_matches_confidence_{min_confidence}_distance_{max_distance}.csv",
-                        mime="text/csv"
-                    )
-                except Exception as e:
-                    st.warning("Could not generate download file")
-            else:
-                st.warning("No match data available to display")
+            display_cols = ['brandName_esb', 'brandName_pulau', 'match_confidence', 'distance_m']
+            avail_cols = [c for c in display_cols if c in filtered_matches.columns]
+            st.dataframe(filtered_matches[avail_cols].sort_values('match_confidence', ascending=False))
         else:
-            st.warning("No matches found with current filters")
+            st.info("Tidak ada match dengan filter saat ini.")
+
+    st.success("✅ App berjalan lancar!")
 
 if __name__ == "__main__":
     main()
